@@ -19,8 +19,6 @@ namespace RaftHash
             Witness,
         }
 
-        private readonly AsyncMonitor monitor = new AsyncMonitor();
-
         private readonly ActorLog log = new ActorLog();
 
         private readonly State state;
@@ -53,8 +51,20 @@ namespace RaftHash
         // Candidate state
         private List<int> votesReceived;
 
+        enum VoteResult
+        {
+            Pending,
+            Won,
+            Lost,
+            TimedOut,
+        };
+
+        private VoteResult voteResult;
+
         // Follower
         private System.Timers.Timer triggerElectionTimer;
+
+        private int lastLeader;
 
         private int CancelElectionMs 
         { 
@@ -92,89 +102,104 @@ namespace RaftHash
 
 
         #region RPC Endpoints
-        async public Task<Result> RequestVote(int term, int candidateId, int lastLogIndex, int lastLogTerm)
+        public Result RequestVote(int term, int candidateId, int lastLogIndex, int lastLogTerm)
         {
-            Log("Got vote request from {0}", candidateId);
-            if (term < log.CurrentTerm)
+            lock (this)
             {
-                Log("Vote request has old term {0}", term);
-                return Failure;
+                Log("Got vote request from {0}", candidateId);
+                if (term < log.CurrentTerm)
+                {
+                    Log("Vote request has old term {0}", term);
+                    return Failure;
+                }
+
+                if (term > log.CurrentTerm)
+                {
+                    log.CurrentTerm = term;
+                    log.FlushState();
+                    ChangeRole(Role.Follower);
+                }
+
+                if (log.VotedFor.HasValue && log.VotedFor.Value != candidateId)
+                {
+                    Log("Already voted for {0}", log.VotedFor.Value);
+                    return Failure;
+                }
+
+                if (!log.IsUpToDate(lastLogIndex, lastLogTerm))
+                {
+                    Log("Candidate not up to date", candidateId);
+                    return Failure;
+                }
+
+                log.VotedFor = candidateId;
+                Log("Voted for {0}", candidateId);
+
+                log.FlushState();
+
+                return Success;
             }
-
-            if (term > log.CurrentTerm)
-            {
-                log.CurrentTerm = term;
-                await log.FlushStateAsync();
-                ChangeRole(Role.Follower);                    
-            }
-
-            if (log.VotedFor.HasValue && log.VotedFor.Value != candidateId)
-            {
-                Log("Already voted for {0}", log.VotedFor.Value);
-                return Failure;
-            }
-
-            if (!log.IsUpToDate(lastLogIndex, lastLogTerm))
-            {
-                Log("Candidate not up to date", candidateId);
-                return Failure;
-            }
-
-            log.VotedFor = candidateId;
-            Log("Voted for {0}", candidateId);
-
-            await log.FlushStateAsync();
-
-            return Success;
 
         }
 
-        async public Task<Result> AppendEntries(int term, int leaderId, int prevLogIndex, int prevLogTerm, List<ActorLog.LogEntry> entries, int leaderCommit)
+        public Result AppendEntries(int term, int leaderId, int prevLogIndex, int prevLogTerm, List<ActorLog.LogEntry> entries, int leaderCommit)
         {
-            if (term < log.CurrentTerm)
+            lock (this)
             {
-                return Failure;
+                Log("Got appendEntries for term {0}, {1}, {2}", term, prevLogIndex, entries.Count);
+                if (term < log.CurrentTerm)
+                {
+                    return Failure;
+                }
+
+                if (term > log.CurrentTerm)
+                {
+                    Log("Updating term");
+                    log.CurrentTerm = term;
+                    log.FlushState();
+                }
+
+                if (role != Role.Follower)
+                {
+                    Log("Changing to follower");
+                    ChangeRole(Role.Follower);
+                }
+
+                Debug.Assert(role == Role.Follower);
+
+                if (log.LastIndex < prevLogIndex)
+                {
+                    Log("Fail: {0} < {1}", log.LastIndex, prevLogIndex);
+                    return Failure;
+                }
+
+                if (log[prevLogIndex].term != prevLogTerm)
+                {
+                    Log("Fail2: {0} != {1}", log[prevLogIndex].term, prevLogTerm);
+                    log.TruncateLog(prevLogIndex);
+                    return Failure;
+                }
+
+                log.AppendLog(prevLogIndex, entries);
+
+                if (leaderCommit > commitIndex)
+                {
+                    commitIndex = Math.Min(leaderCommit, log.LastIndex);
+                }
+
+                while (commitIndex > lastApplied)
+                {
+                    ++lastApplied;
+                    state.Apply(log[lastApplied]);
+                    Log("Applied " + lastApplied);
+                }
+
+                lastLeader = leaderId;
+
+                ResetTriggerElectionTimer();
+                Log("Yo");
+                return Success;
             }
-
-            if (term > log.CurrentTerm)
-            {
-                log.CurrentTerm = term;
-                await log.FlushStateAsync();
-            }
-
-            if (role != Role.Follower)
-            {
-                ChangeRole(Role.Follower);
-            }
-
-            Debug.Assert(role == Role.Follower);
-
-            if (log.LastIndex < prevLogIndex)
-            {
-                return Failure;
-            }
-
-            if (log[prevLogIndex].term != prevLogTerm)
-            {
-                log.TruncateLog(prevLogIndex);
-                return Failure;
-            }
-
-            log.AppendLog(prevLogIndex, entries);
-
-            if (leaderCommit > commitIndex)
-            {
-                commitIndex = Math.Min(leaderCommit, log.LastIndex);
-            }
-
-            while (commitIndex > lastApplied)
-            {
-                ++lastApplied;
-                state.Apply(log[lastApplied]);
-            }
-
-            ResetTriggerElectionTimer();
-            return Success;
         }
 
         #endregion
@@ -188,49 +213,49 @@ namespace RaftHash
 
             this.role = role;
 
-            monitor.PulseAll();
+            Monitor.PulseAll(this);
         }
 
         #region Candidate 
-        async private Task RunElection()
+        private void RunElection()
         {
 			log.CurrentTerm++;
             Log("Starting election with term {0}", log.CurrentTerm);
 
-			log.VotedFor = me;
-            await log.FlushStateAsync();
+            log.FlushState();            
             votesReceived = new List<int>();
+            voteResult = VoteResult.Pending;
 
             List<Task<Result>> tasks = new List<Task<Result>>(state.ClusterMembers.Count());
-            var endElectionTask = DelayEndElection();
-            tasks.Add(endElectionTask);
+
+            Task.Delay(CancelElectionMs).ContinueWith((x) => DoCancelElection(log.CurrentTerm));
             
             for (int idx = 0; idx < state.ClusterMembers.Count(); idx++)
             {
-                if (idx == me)
-                {
-                    votesReceived.Add(me);
-
-                }
-                else
-                {
-                    tasks.Add(remote.RequestVote(state.ClusterMembers.ElementAt(idx), log.CurrentTerm, me, log.LastIndex, log[log.LastIndex].term));                    
-                }
+                remote.RequestVote(state.ClusterMembers.ElementAt(idx), log.CurrentTerm, me, log.LastIndex, log[log.LastIndex].term).ContinueWith((r) => HandleVote(r, log.CurrentTerm));
             }
 
-            while (tasks.Count() > 0)
+            var currentTerm = log.CurrentTerm;
+
+            while (voteResult == VoteResult.Pending && !exit)
             {
-                var task = await Task.WhenAny(tasks);
-                tasks.Remove(task);    
-                if (task == endElectionTask)
+                Monitor.Wait(this, 1000);
+            }
+        }
+
+        private void HandleVote(Task<Result> task, int term)
+        {
+            lock (this)
+            {
+                if (term != log.CurrentTerm || role != Role.Candidate || voteResult != VoteResult.Pending)
                 {
-                    Log("Election timed out");
-                    break;
+                    // Old vote, ignore.
+                    return;
                 }
                 if (!task.IsCompleted)
                 {
                     Log("Task did not complete");
-                    continue;
+                    return;
                 }
                 if (task.Result.term > log.CurrentTerm)
                 {
@@ -238,7 +263,7 @@ namespace RaftHash
                     log.CurrentTerm = task.Result.term;
                     log.FlushState();
                     ChangeRole(Role.Follower);
-                    break;
+                    voteResult = VoteResult.Lost;
                 }
                 if (task.Result.success)
                 {
@@ -247,21 +272,28 @@ namespace RaftHash
                     if (state.CheckMajority(votesReceived))
                     {
                         ChangeRole(Role.Leader);
-                        break;
+                        voteResult = VoteResult.Won;
                     }
                 }
+                Monitor.PulseAll(this);
             }
         }
-
-        async Task<Result> DelayEndElection()
+        private void DoCancelElection(int term)
         {
-            await Task.Delay(CancelElectionMs);
-            return Success;
+            lock (this)
+            {
+                if (term != log.CurrentTerm || role != Role.Candidate || voteResult != VoteResult.Pending)
+                {
+                    // Old vote, ignore.
+                    return;
+                }
+                voteResult = VoteResult.TimedOut;
+                Monitor.PulseAll(this);
+            }
         }
-        
+                
         #endregion
-
-
+        
         #region Leader
         private void LeaderHeartbeatAll()
         {
@@ -272,7 +304,7 @@ namespace RaftHash
                     pendingAppends[idx] = null;
                     continue;
                 }
-                if (pendingAppends[idx] == null && (matchIndex[idx] < log.LastIndex || (lastHeartbeat[idx] - DateTime.UtcNow).TotalMilliseconds > LeaderHeartbeatIntervalMs))
+                if (pendingAppends[idx] == null && (matchIndex[idx] < log.LastIndex || (DateTime.UtcNow - lastHeartbeat[idx]).TotalMilliseconds > LeaderHeartbeatIntervalMs))
                 {
                     LeaderHeartbeat(idx);                    
                 }
@@ -292,14 +324,14 @@ namespace RaftHash
                 log[prevIndex].term,
                 log.Slice(nextIndex[idx]),
                 commitIndex);
-
-            pendingAppends[idx].ContinueWith(x => AppendEntriesDone(idx, log.LastIndex, x));
+            int lastIndex = log.LastIndex;
+            pendingAppends[idx].ContinueWith(x => AppendEntriesDone(idx, lastIndex, x));
         }
 
         // Called on threadpool thread when AppendEntries return
         private void AppendEntriesDone(int member, int lastIndex, Task<Result> task)
         {
-            using (monitor.Enter())
+            lock(this)
             {
                 pendingAppends[member] = null;
 
@@ -362,43 +394,32 @@ namespace RaftHash
             while (commitIndex > lastApplied)
             {
                 stateChanged = true;
-                state.Apply(log[lastApplied++]);
+                state.Apply(log[++lastApplied]);
             }
             if (stateChanged)
             {
-                monitor.PulseAll();
+                Monitor.PulseAll(this);
             }
         }
 
-        async private Task LeaderLoop()
+        private void LeaderLoop()
         {
             Log("Becoming leader");
 
-            nextIndex = new List<int>(state.ClusterMembers.Count());
-            matchIndex = new List<int>(state.ClusterMembers.Count());
-            pendingAppends = new List<Task<Result>>(state.ClusterMembers.Count());
-            lastHeartbeat = new List<DateTime>(state.ClusterMembers.Count());
-
-            for (int i = 0; i < nextIndex.Count(); i++)
-            {
-                nextIndex[i] = log.LastIndex + 1;
-                matchIndex[i] = -1;
-                pendingAppends[i] = null;
-                lastHeartbeat[i] = DateTime.MinValue;
-            }
+            nextIndex = new List<int>(Enumerable.Repeat(log.LastIndex + 1, state.ClusterMembers.Count()));
+            matchIndex = new List<int>(Enumerable.Repeat(-1, state.ClusterMembers.Count()));
+            pendingAppends = new List<Task<Result>>(Enumerable.Repeat<Task<Result>>(null, state.ClusterMembers.Count()));
+            lastHeartbeat = new List<DateTime>(Enumerable.Repeat(DateTime.MinValue, state.ClusterMembers.Count()));
 
             while (role == Role.Leader && !exit)
             {
+                Log("Leader heartbeat loop");
                 LeaderHeartbeatAll();
-                try
-                {
-                    await monitor.WaitAsync(new CancellationTokenSource(LeaderHeartbeatIntervalMs).Token);
-                }
-                catch (OperationCanceledException) { }
+                Monitor.Wait(this, LeaderHeartbeatIntervalMs);
             }
         }
 
-        async private Task FollowerLoop()
+        private void FollowerLoop()
         {
             Log("Becoming follower");
 
@@ -411,76 +432,83 @@ namespace RaftHash
 
             while (role == Role.Follower && !exit)
             {
-                await monitor.WaitAsync();
+                Monitor.Wait(this);
             }
 
             triggerElectionTimer.Dispose();
+            triggerElectionTimer = null;                 
         }
 
         private void triggerElectionTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
         {
-            ChangeRole(Role.Candidate);
+            lock (this)
+            {
+                Log("Timed out, triggering election");
+                ChangeRole(Role.Candidate);
+            }
         }
 
         private void ResetTriggerElectionTimer()
         {
-            triggerElectionTimer.Stop();
-            triggerElectionTimer.Start();
-        }
-
-        async private Task CandidateLoop()
-        {
-            using (await monitor.EnterAsync())
+            lock (this)
             {
-                Log("Becoming candidate");
-
-                while (role == Role.Candidate && !exit)
+                if (triggerElectionTimer != null)
                 {
-                    await RunElection();
+                    Log("Resetting election timer");
+                    
+                    triggerElectionTimer.Stop();
+                    triggerElectionTimer.Interval = TriggerElectionTimeoutMs;
+                    triggerElectionTimer.Start();
                 }
             }
-
         }
 
-        async private Task Loop()
+        private void CandidateLoop()
         {
-            while (!exit)
+            Log("Becoming candidate");
+
+            while (role == Role.Candidate && !exit)
             {
-                try
+                RunElection();
+            }
+        }
+
+        public void Loop()
+        {            
+            lock (this)
+            {
+                while (!exit)
                 {
-                    switch (role)
+
+                    try
                     {
-                        case Role.Leader:
-                            await LeaderLoop();
-                            break;
-                        case Role.Follower:
-                            await FollowerLoop();
-                            break;
-                        case Role.Candidate:
-                            await CandidateLoop();
-                            break;
+                        switch (role)
+                        {
+                            case Role.Leader:
+                                LeaderLoop();
+                                break;
+                            case Role.Follower:
+                                FollowerLoop();
+                                break;
+                            case Role.Candidate:
+                                CandidateLoop();
+                                break;
+                        }
                     }
-                } 
-                catch (AggregateException e)
-                {
-                    throw e.InnerException;
+                    catch (AggregateException e)
+                    {
+                        throw e.InnerException;
+                    }
                 }
             }
         }
-
-        public void Run()
-        {
-            AsyncPump.Run(async delegate { await Loop(); });
-        }
-
-
 
         public void Exit()
         {
-            using (monitor.Enter())
+            lock(this)
             {
                 exit = true;
-                monitor.PulseAll();
+                Monitor.PulseAll(this);
             }
         }
 
@@ -505,7 +533,8 @@ namespace RaftHash
 
         async public Task SetValueAsync(string key, string value)
         {
-            using (await monitor.EnterAsync())
+            int index;
+            lock(this)
             {
                 if (role != Role.Leader)
                 {
@@ -520,27 +549,41 @@ namespace RaftHash
                 }
 
 
-                int index = log.Add(new ActorLog.LogEntry
+                index = log.Add(new ActorLog.LogEntry
                 {
                     type = ActorLog.LogType.AddMember,
                     key = key,
                     value = value,
+                    term = log.CurrentTerm,
                 });
 
-                monitor.PulseAll();
+                matchIndex[me] = index;
 
-                while (lastApplied < index)
-                {
-                    await monitor.WaitAsync();
-                }
-
+                Monitor.Pulse(this);             
             }
+
+            await WaitForApplied(index);
+            Log("Successfully set {0} to {1} at {2}", key, value, index);
+        }
+
+        async private Task WaitForApplied(int index)
+        {
+            await Task.Run(() =>
+            {
+                lock (this)
+                {
+                    while (lastApplied < index)
+                    {
+                        Monitor.Wait(this);
+                    }                    
+                }
+            });            
         }
         
         public string GetValue(string key)
         {
-            using (monitor.Enter())
-            {
+            lock(this)
+                {
                 if (role != Role.Leader)
                 {
                     if (log.VotedFor.HasValue)

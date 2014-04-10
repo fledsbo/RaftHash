@@ -34,7 +34,7 @@ namespace RaftHash
             switch (logEntry.type)
             {
                 case ActorLog.LogType.AddMember:
-                    data[logEntry.key] = data[logEntry.value];
+                    data.AddOrUpdate(logEntry.key, logEntry.value, (key, value) => logEntry.value);
                     break;
 
                 case ActorLog.LogType.RemoveMember:

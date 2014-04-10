@@ -94,13 +94,13 @@ namespace RaftHash
             return false;
         }
 
-        internal LogEntry this[int index] { get { return index == -1 ? Genesis : log[index]; } }
+        internal LogEntry this[int index] { get { return index < 0 ? Genesis : log[index]; } }
 
         internal int LastIndex { get { return log.Count() - 1; } }
 
         internal bool IsUpToDate(int lastLogIndex, int lastLogTerm)
         {
-            if (LastIndex == -1)
+            if (LastIndex < 0)
             {
                 return true;
             }

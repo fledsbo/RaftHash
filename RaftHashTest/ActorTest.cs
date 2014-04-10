@@ -18,14 +18,15 @@ namespace RaftHashTest
 
         public async Task<Result> RequestVote(string target, int term, int candidateId, int lastLogIndex, int lastLogTerm)
         {
+            Console.WriteLine("In RequestVote!");
             var actor = actors[target];
-            return await actor.RequestVote(term, candidateId, lastLogIndex, lastLogTerm);
+            return await Task.Factory.StartNew<Result>(() => actor.RequestVote(term, candidateId, lastLogIndex, lastLogTerm));
         }
 
         public async Task<Result> AppendEntries(string target, int term, int leaderId, int prevLogIndex, int prevLogTerm, List<ActorLog.LogEntry> entries, int leaderCommit)
         {
             var actor = actors[target];
-            return await actor.AppendEntries(term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit);
+            return await Task.Factory.StartNew<Result>(() => actor.AppendEntries(term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit));
         }
     }
     
@@ -45,7 +46,7 @@ namespace RaftHashTest
             foreach (var member in actorNames)
             {
                 var actor = new Actor(member, actorNames, dispatcher);
-                var thread = new Thread(x => actor.Run());
+                var thread = new Thread(x => actor.Loop());
                 actors.Add(member, actor);
                 threads.Add(thread);
             }
@@ -62,6 +63,11 @@ namespace RaftHashTest
                 CallOnLeader(actors, x => Assert.AreEqual(i.ToString(), x.GetValue(i.ToString())));
             }
 
+            foreach (var actor in actors.Values)
+            {
+                actor.Exit();
+            }
+            
             foreach (var thread in threads)
             {
                 thread.Join();
